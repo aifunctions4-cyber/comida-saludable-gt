@@ -23,7 +23,9 @@ def privacy():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Política de Privacidad - Comida Saludable GT</title>
     </head>
-    <body style="font-family: Arial; max-width: 900px; margin: 40px auto; line-height: 1.6; padding: 0 20px;">
+    <body style="font-family: Arial; max-width: 900px; margin: 40px auto;
+                 line-height: 1.6; padding: 0 20px;">
+
         <h1>Política de Privacidad</h1>
 
         <h3>Comida Saludable GT</h3>
@@ -69,12 +71,14 @@ def privacy():
         Para consultas relacionadas con esta política puedes contactar a
         Comida Saludable GT.
         </p>
+
     </body>
     </html>
     """, 200
 
 
 def enviar_mensaje(recipient_id, texto):
+
     url = "https://graph.instagram.com/v24.0/me/messages"
 
     headers = {
@@ -92,6 +96,7 @@ def enviar_mensaje(recipient_id, texto):
     }
 
     try:
+
         response = requests.post(
             url,
             headers=headers,
@@ -99,12 +104,23 @@ def enviar_mensaje(recipient_id, texto):
             timeout=15
         )
 
-        print("Respuesta API Instagram:", response.status_code, response.text)
+        print(
+            "Respuesta API Instagram:",
+            response.status_code,
+            response.text,
+            flush=True
+        )
 
         return response
 
     except Exception as e:
-        print("Error enviando mensaje:", str(e))
+
+        print(
+            "Error enviando mensaje:",
+            str(e),
+            flush=True
+        )
+
         return None
 
 
@@ -119,17 +135,28 @@ def webhook():
         challenge = request.args.get("hub.challenge")
 
         if mode == "subscribe" and token == VERIFY_TOKEN:
-            print("Webhook verificado correctamente")
+
+            print(
+                "Webhook verificado correctamente",
+                flush=True
+            )
+
             return challenge, 200
 
         return "Verificación fallida", 403
 
-    # Recibir eventos de Instagram
+
+    # Eventos enviados por Instagram
     data = request.get_json(silent=True) or {}
 
-    print("Evento recibido de Meta:", data)
+    print(
+        "Evento recibido de Meta:",
+        data,
+        flush=True
+    )
 
     try:
+
         entries = data.get("entry", [])
 
         for entry in entries:
@@ -138,33 +165,70 @@ def webhook():
 
             for event in messaging_events:
 
+                message = event.get("message", {})
+
+                # IMPORTANTE:
+                # Ignorar mensajes enviados por nuestro propio bot.
+                if message.get("is_echo") is True:
+
+                    print(
+                        "Evento is_echo ignorado",
+                        flush=True
+                    )
+
+                    continue
+
                 sender = event.get("sender", {})
                 sender_id = sender.get("id")
 
-                message = event.get("message", {})
-
-                # Ignorar eventos que no contienen texto
                 texto = message.get("text")
 
                 if not sender_id or not texto:
                     continue
 
-                print("Mensaje recibido:", texto)
-                print("Sender ID:", sender_id)
+                print(
+                    "Mensaje recibido:",
+                    texto,
+                    flush=True
+                )
+
+                print(
+                    "Sender ID:",
+                    sender_id,
+                    flush=True
+                )
 
                 respuesta = (
                     "¡Hola! 👋 Gracias por escribir a Comida Saludable GT. "
                     "¿En qué podemos ayudarte?"
                 )
 
-                enviar_mensaje(sender_id, respuesta)
+                enviar_mensaje(
+                    sender_id,
+                    respuesta
+                )
 
     except Exception as e:
-        print("Error procesando webhook:", str(e))
+
+        print(
+            "Error procesando webhook:",
+            str(e),
+            flush=True
+        )
 
     return "EVENT_RECEIVED", 200
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            8080
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
