@@ -1,4 +1,5 @@
 import os
+import requests
 from flask import Flask, request
 
 app = Flask(__name__)
@@ -22,65 +23,89 @@ def privacy():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Política de Privacidad - Comida Saludable GT</title>
     </head>
-
-    <body style="font-family: Arial, sans-serif; max-width: 800px;
-                 margin: 40px auto; padding: 20px; line-height: 1.6;">
-
+    <body style="font-family: Arial; max-width: 900px; margin: 40px auto; line-height: 1.6; padding: 0 20px;">
         <h1>Política de Privacidad</h1>
 
-        <p><strong>Comida Saludable GT</strong></p>
+        <h3>Comida Saludable GT</h3>
 
         <p>
-        Esta Política de Privacidad explica cómo Comida Saludable GT
-        procesa información relacionada con las interacciones realizadas
-        a través de nuestra cuenta de Instagram.
+        Esta Política de Privacidad explica cómo Comida Saludable GT procesa
+        información relacionada con las interacciones realizadas a través
+        de nuestra cuenta de Instagram.
         </p>
 
         <h2>Información que procesamos</h2>
 
         <p>
-        Podemos procesar mensajes, identificadores de usuario y otra
-        información proporcionada voluntariamente cuando una persona
-        interactúa con nuestra cuenta de Instagram.
+        Podemos procesar mensajes, identificadores de usuario y otra información
+        proporcionada voluntariamente cuando una persona interactúa con nuestra
+        cuenta de Instagram.
         </p>
 
         <h2>Uso de la información</h2>
 
         <p>
-        Utilizamos esta información para responder mensajes, brindar
-        información solicitada y operar las funciones automatizadas de
-        Comida Saludable GT.
+        Utilizamos esta información para responder mensajes, brindar información
+        solicitada y operar las funciones automatizadas de Comida Saludable GT.
         </p>
 
         <h2>Compartición de información</h2>
 
         <p>
-        No vendemos información personal. La información puede ser
-        procesada por proveedores tecnológicos necesarios para operar
-        nuestro servicio.
+        No vendemos información personal. La información puede ser procesada por
+        proveedores tecnológicos necesarios para operar nuestro servicio.
         </p>
 
         <h2>Eliminación de datos</h2>
 
         <p>
-        Los usuarios pueden solicitar la eliminación de su información
-        contactando directamente a Comida Saludable GT mediante nuestra
-        cuenta oficial de Instagram.
+        Los usuarios pueden solicitar la eliminación de su información contactando
+        directamente a Comida Saludable GT mediante nuestra cuenta oficial de Instagram.
         </p>
 
         <h2>Contacto</h2>
 
         <p>
-        Para consultas relacionadas con esta Política de Privacidad,
-        puedes contactar a Comida Saludable GT mediante nuestra cuenta
-        oficial de Instagram.
+        Para consultas relacionadas con esta política puedes contactar a
+        Comida Saludable GT.
         </p>
-
-        <p><strong>Última actualización:</strong> 31 de agosto de 2026.</p>
-
     </body>
     </html>
     """, 200
+
+
+def enviar_mensaje(recipient_id, texto):
+    url = "https://graph.instagram.com/v24.0/me/messages"
+
+    headers = {
+        "Authorization": f"Bearer {INSTAGRAM_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "recipient": {
+            "id": recipient_id
+        },
+        "message": {
+            "text": texto
+        }
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=15
+        )
+
+        print("Respuesta API Instagram:", response.status_code, response.text)
+
+        return response
+
+    except Exception as e:
+        print("Error enviando mensaje:", str(e))
+        return None
 
 
 @app.route("/webhook", methods=["GET", "POST"])
@@ -99,10 +124,43 @@ def webhook():
 
         return "Verificación fallida", 403
 
-    # Eventos enviados por Instagram / Meta
+    # Recibir eventos de Instagram
     data = request.get_json(silent=True) or {}
 
-    print("Evento recibido de Meta:", data, flush=True)
+    print("Evento recibido de Meta:", data)
+
+    try:
+        entries = data.get("entry", [])
+
+        for entry in entries:
+
+            messaging_events = entry.get("messaging", [])
+
+            for event in messaging_events:
+
+                sender = event.get("sender", {})
+                sender_id = sender.get("id")
+
+                message = event.get("message", {})
+
+                # Ignorar eventos que no contienen texto
+                texto = message.get("text")
+
+                if not sender_id or not texto:
+                    continue
+
+                print("Mensaje recibido:", texto)
+                print("Sender ID:", sender_id)
+
+                respuesta = (
+                    "¡Hola! 👋 Gracias por escribir a Comida Saludable GT. "
+                    "¿En qué podemos ayudarte?"
+                )
+
+                enviar_mensaje(sender_id, respuesta)
+
+    except Exception as e:
+        print("Error procesando webhook:", str(e))
 
     return "EVENT_RECEIVED", 200
 
