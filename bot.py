@@ -11,6 +11,7 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+
 # --------------------------------------------------
 # INSTRUCCIONES DE COMIDA SALUDABLE GT
 # --------------------------------------------------
@@ -31,7 +32,7 @@ Puedes hablar sobre:
 - alimentación antiinflamatoria
 - reducción del consumo de azúcar
 - hábitos saludables
-- ideas de desayunos, almuerzos, cenas y snacks
+- desayunos, almuerzos, cenas y snacks
 - planes y menús de alimentación
 - control de peso desde hábitos saludables
 - alimentación para apoyar objetivos de bienestar
@@ -39,25 +40,26 @@ Puedes hablar sobre:
 - organización de comidas
 
 ESTILO:
-- Habla en español claro, cálido y natural.
+- Habla siempre en español claro, cálido y natural.
 - Responde como una conversación de Instagram.
-- Evita respuestas demasiado largas.
+- Sé breve y directo.
+- Evita explicaciones largas.
+- Cada respuesta debe intentar mantenerse por debajo de 800 caracteres.
 - Primero ayuda a la persona.
-- Haz preguntas cuando necesites conocer mejor su objetivo.
+- Haz solamente las preguntas necesarias.
+- No repitas información innecesariamente.
 - No intentes vender algo en absolutamente cada mensaje.
 - Cuando exista una oportunidad natural, menciona que Comida Saludable GT
   cuenta con recetas, recetarios, guías, ebooks o planes relacionados.
 
 IMPORTANTE:
-No diagnostiques enfermedades.
-No afirmes que un alimento, dieta, suplemento o producto cura enfermedades.
-No sustituyas la evaluación de médicos, nutricionistas u otros profesionales.
-Si la persona describe síntomas preocupantes o solicita tratamiento médico,
-recomienda consultar a un profesional de salud.
-
-Si alguien pregunta por una enfermedad o condición médica, puedes ofrecer
-información general sobre alimentación, pero aclara que no constituye
-diagnóstico ni tratamiento médico.
+- No diagnostiques enfermedades.
+- No afirmes que un alimento, dieta, suplemento o producto cura enfermedades.
+- No sustituyas la evaluación de médicos, nutricionistas u otros profesionales.
+- Si la persona describe síntomas preocupantes o solicita tratamiento médico,
+  recomienda consultar a un profesional de salud.
+- Si pregunta por una enfermedad o condición médica, puedes brindar información
+  general sobre alimentación, pero no presentarla como diagnóstico o tratamiento.
 
 OBJETIVO COMERCIAL:
 Queremos convertir conversaciones útiles en potenciales clientes.
@@ -65,14 +67,19 @@ Queremos convertir conversaciones útiles en potenciales clientes.
 La secuencia ideal es:
 
 1. Entender qué busca la persona.
-2. Dar una respuesta útil.
+2. Dar una respuesta útil y breve.
 3. Identificar su objetivo.
 4. Cuando corresponda, mencionar una solución de Comida Saludable GT.
 5. Preguntar si desea conocer las opciones disponibles.
 
-Nunca inventes precios, productos o enlaces que no hayan sido proporcionados.
+Nunca inventes precios, productos, promociones o enlaces que no hayan sido
+proporcionados.
 
-Si la persona simplemente saluda por primera vez, responde:
+IMPORTANTE:
+Actualmente no tienes acceso directo al catálogo ni a los PDFs de
+Comida Saludable GT. No inventes el contenido específico de un producto.
+
+Si la persona simplemente saluda, responde:
 
 "¡Hola! 👋 Bienvenido a Comida Saludable GT 🌿
 
@@ -211,6 +218,45 @@ def generar_respuesta(mensaje_usuario):
 
 
 # --------------------------------------------------
+# DIVIDIR MENSAJES LARGOS
+# --------------------------------------------------
+
+def dividir_mensaje(texto, limite=900):
+
+    texto = texto.strip()
+
+    if len(texto) <= limite:
+        return [texto]
+
+    partes = []
+
+    while len(texto) > limite:
+
+        corte = texto.rfind("\n", 0, limite)
+
+        if corte == -1:
+            corte = texto.rfind(". ", 0, limite)
+
+        if corte == -1:
+            corte = texto.rfind(" ", 0, limite)
+
+        if corte == -1:
+            corte = limite
+
+        parte = texto[:corte].strip()
+
+        if parte:
+            partes.append(parte)
+
+        texto = texto[corte:].strip()
+
+    if texto:
+        partes.append(texto)
+
+    return partes
+
+
+# --------------------------------------------------
 # ENVIAR MENSAJE A INSTAGRAM
 # --------------------------------------------------
 
@@ -223,36 +269,44 @@ def enviar_mensaje_instagram(recipient_id, texto):
         "Content-Type": "application/json"
     }
 
-    payload = {
-        "recipient": {
-            "id": recipient_id
-        },
-        "message": {
-            "text": texto
+    partes = dividir_mensaje(texto)
+
+    for parte in partes:
+
+        payload = {
+            "recipient": {
+                "id": recipient_id
+            },
+            "message": {
+                "text": parte
+            }
         }
-    }
 
-    try:
+        try:
 
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=15
-        )
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=15
+            )
 
-        print(
-            "Respuesta API Instagram:",
-            response.status_code,
-            response.text
-        )
+            print(
+                "Respuesta API Instagram:",
+                response.status_code,
+                response.text
+            )
 
-        return response
+            if response.status_code != 200:
+                print("ERROR enviando mensaje a Instagram")
+                return response
 
-    except Exception as e:
+        except Exception as e:
 
-        print("ERROR INSTAGRAM:", str(e))
-        return None
+            print("ERROR INSTAGRAM:", str(e))
+            return None
+
+    return True
 
 
 # --------------------------------------------------
@@ -296,15 +350,14 @@ def webhook():
                 if not message:
                     continue
 
-                # MUY IMPORTANTE:
-                # Ignorar mensajes enviados por el propio bot.
+                # Ignorar mensajes enviados por el propio bot
                 if message.get("is_echo"):
                     print("Echo ignorado correctamente")
                     continue
 
-                # Ignorar eventos sin texto
                 texto_usuario = message.get("text")
 
+                # Por ahora ignoramos fotos, audios, stickers, etc.
                 if not texto_usuario:
                     print("Mensaje sin texto ignorado")
                     continue
@@ -318,12 +371,10 @@ def webhook():
                 print("Mensaje recibido:", texto_usuario)
                 print("Sender ID:", sender_id)
 
-                # Generar respuesta inteligente
                 respuesta_ia = generar_respuesta(texto_usuario)
 
                 print("Respuesta IA:", respuesta_ia)
 
-                # Enviar respuesta a Instagram
                 enviar_mensaje_instagram(
                     sender_id,
                     respuesta_ia
@@ -331,7 +382,6 @@ def webhook():
 
     except Exception as e:
 
-        # Siempre devolvemos 200 a Meta para evitar reintentos innecesarios
         print("ERROR PROCESANDO WEBHOOK:", str(e))
 
     return "EVENT_RECEIVED", 200
