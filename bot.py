@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 from flask import Flask, request
 from openai import OpenAI
@@ -16,6 +17,84 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # --------------------------------------------------
+# MEMORIA CORTA DE CONVERSACION
+# --------------------------------------------------
+
+# Esta memoria vive solamente dentro del proceso de Railway.
+# No utiliza una base de datos permanente.
+memoria_conversaciones = {}
+
+# 60 minutos
+MEMORIA_DURACION = 60 * 60
+
+# Máximo de mensajes anteriores que se enviarán como contexto
+MAX_MENSAJES_MEMORIA = 6
+
+
+def obtener_memoria(sender_id):
+
+    ahora = time.time()
+
+    datos = memoria_conversaciones.get(sender_id)
+
+    if not datos:
+        return []
+
+    ultima_actividad = datos.get("ultima_actividad", 0)
+
+    # Si pasó más de una hora, olvidar la conversación
+    if ahora - ultima_actividad > MEMORIA_DURACION:
+        memoria_conversaciones.pop(sender_id, None)
+        return []
+
+    return datos.get("mensajes", [])
+
+
+def guardar_en_memoria(sender_id, rol, contenido):
+
+    ahora = time.time()
+
+    datos = memoria_conversaciones.get(
+        sender_id,
+        {
+            "mensajes": [],
+            "ultima_actividad": ahora
+        }
+    )
+
+    datos["mensajes"].append(
+        {
+            "role": rol,
+            "content": contenido
+        }
+    )
+
+    # Conservar únicamente los mensajes más recientes
+    datos["mensajes"] = datos["mensajes"][-MAX_MENSAJES_MEMORIA:]
+
+    datos["ultima_actividad"] = ahora
+
+    memoria_conversaciones[sender_id] = datos
+
+
+def limpiar_memorias_expiradas():
+
+    ahora = time.time()
+
+    expiradas = []
+
+    for sender_id, datos in memoria_conversaciones.items():
+
+        ultima_actividad = datos.get("ultima_actividad", 0)
+
+        if ahora - ultima_actividad > MEMORIA_DURACION:
+            expiradas.append(sender_id)
+
+    for sender_id in expiradas:
+        memoria_conversaciones.pop(sender_id, None)
+
+
+# --------------------------------------------------
 # INSTRUCCIONES DE COMIDA SALUDABLE GT
 # --------------------------------------------------
 
@@ -27,6 +106,25 @@ ideas de comidas y menús saludables adaptados a lo que buscan.
 
 Tienes acceso mediante una herramienta interna a una biblioteca privada de
 contenido aprobado por Comida Saludable GT.
+
+
+CONTEXTO DE LA CONVERSACION:
+
+Puedes recibir los mensajes recientes de la conversación actual.
+
+Utiliza ese contexto para recordar lo que la persona acaba de decir, por ejemplo:
+- ingredientes que tiene
+- ingredientes que no quiere
+- preferencias
+- cantidad de personas
+- tiempo disponible
+- tipo de comida que busca
+- respuestas que haya dado a tus preguntas anteriores
+
+No vuelvas a preguntar algo que la persona ya respondió.
+
+Si el contexto reciente y el mensaje actual contienen suficiente información,
+crea la receta directamente.
 
 
 PERSONALIZACION DE RECETAS:
@@ -45,6 +143,7 @@ Cuando sea útil, adapta la receta tomando en cuenta información como:
 - deseo de reducir azúcar añadido
 - otras necesidades culinarias que la persona indique
 
+
 REGLA DE LAS 2 PREGUNTAS:
 
 Puedes hacer un máximo de 2 preguntas antes de crear una receta.
@@ -58,30 +157,13 @@ No hagas siempre las mismas preguntas.
 
 Nunca preguntes algo que la persona ya explicó.
 
-Si el mensaje ya contiene suficiente información, NO hagas preguntas
-adicionales y crea la receta directamente.
-
-Ejemplo:
-
-Usuario:
-"Quiero una cena saludable."
-
-Puedes preguntar:
-
-"¡Claro! 😊 Para adaptarla mejor a lo que buscas:
-
-1. ¿Hay algún ingrediente que quieras usar o evitar?
-2. ¿La prefieres rápida, ligera o tienes alguna otra preferencia?"
-
-Pero si el usuario dice:
-
-"Tengo pollo, aguacate y tomate. Quiero una cena rápida sin lácteos."
-
-No necesitas preguntar nada.
-Crea directamente una receta tomando en cuenta esa información.
+Si el mensaje actual y el contexto reciente contienen suficiente información,
+NO hagas preguntas adicionales y crea la receta directamente.
 
 No conviertas la conversación en un cuestionario.
-El objetivo es facilitarle las cosas a la persona.
+
+Después de que la persona responda tus preguntas, utiliza esas respuestas
+para crear la receta. No vuelvas a iniciar otra ronda de preguntas.
 
 
 USA EL CONOCIMIENTO DISPONIBLE PARA:
@@ -105,7 +187,6 @@ redactadas con tus propias palabras.
 
 Cuando una persona pida una receta y tengas suficiente información,
 intenta incluir:
-
 - nombre de la receta
 - ingredientes
 - preparación sencilla
@@ -327,17 +408,38 @@ def privacy():
 
 
 # --------------------------------------------------
-# GENERAR RESPUESTA CON OPENAI + FILE SEARCH
+# GENERAR RESPUESTA CON OPENAI + FILE SEARCH + MEMORIA
 # --------------------------------------------------
 
-def generar_respuesta(mensaje_usuario):
+def generar_respuesta(sender_id, mensaje_usuario):
 
     try:
+
+        limpiar_memorias_expiradas()
+
+        historial = obtener_memoria(sender_id)
+
+        mensajes = []
+
+        for mensaje in historial:
+            mensajes.append(
+                {
+                    "role": mensaje["role"],
+                    "content": mensaje["content"]
+                }
+            )
+
+        mensajes.append(
+            {
+                "role": "user",
+                "content": mensaje_usuario
+            }
+        )
 
         response = client.responses.create(
             model="gpt-5.6-luna",
             instructions=SYSTEM_PROMPT,
-            input=mensaje_usuario,
+            input=mensajes,
             tools=[
                 {
                     "type": "file_search",
@@ -350,10 +452,22 @@ def generar_respuesta(mensaje_usuario):
         respuesta = response.output_text.strip()
 
         if not respuesta:
-            return (
+            respuesta = (
                 "¡Hola! 👋 Cuéntame qué te gustaría preparar: "
                 "una receta, un postre, un snack o un menú saludable."
             )
+
+        guardar_en_memoria(
+            sender_id,
+            "user",
+            mensaje_usuario
+        )
+
+        guardar_en_memoria(
+            sender_id,
+            "assistant",
+            respuesta
+        )
 
         return respuesta
 
@@ -522,7 +636,10 @@ def webhook():
                 print("Mensaje recibido:", texto_usuario)
                 print("Sender ID:", sender_id)
 
-                respuesta_ia = generar_respuesta(texto_usuario)
+                respuesta_ia = generar_respuesta(
+                    sender_id,
+                    texto_usuario
+                )
 
                 print("Respuesta IA:", respuesta_ia)
 
