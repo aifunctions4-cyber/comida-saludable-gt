@@ -1,19 +1,178 @@
 import os
 import time
 import requests
+import psycopg
+
 from flask import Flask, request
 from openai import OpenAI
 
+
 app = Flask(__name__)
+
+
+# --------------------------------------------------
+# VARIABLES DE ENTORNO
+# --------------------------------------------------
 
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 INSTAGRAM_ACCESS_TOKEN = os.environ.get("INSTAGRAM_ACCESS_TOKEN", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
 
 # Biblioteca privada de Comida Saludable GT
 VECTOR_STORE_ID = "vs_6a9b49945b088191b211d8b71fdb9d0d"
 
+
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+# --------------------------------------------------
+# BASE DE DATOS POSTGRESQL
+# --------------------------------------------------
+
+def obtener_conexion_db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL no está configurada")
+
+    return psycopg.connect(DATABASE_URL)
+
+
+def inicializar_base_datos():
+    try:
+        with obtener_conexion_db() as conn:
+            with conn.cursor() as cur:
+
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS instagram_users (
+                        sender_id TEXT PRIMARY KEY,
+                        free_recipe_used BOOLEAN NOT NULL DEFAULT FALSE,
+                        paid_access BOOLEAN NOT NULL DEFAULT FALSE,
+                        last_recipe TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+
+            conn.commit()
+
+        print("Base de datos PostgreSQL inicializada correctamente")
+
+    except Exception as e:
+        print("ERROR INICIALIZANDO POSTGRESQL:", str(e))
+
+
+def obtener_usuario_db(sender_id):
+    try:
+        with obtener_conexion_db() as conn:
+            with conn.cursor() as cur:
+
+                cur.execute(
+                    """
+                    INSERT INTO instagram_users (sender_id)
+                    VALUES (%s)
+                    ON CONFLICT (sender_id) DO NOTHING
+                    """,
+                    (sender_id,)
+                )
+
+                cur.execute(
+                    """
+                    SELECT
+                        free_recipe_used,
+                        paid_access,
+                        last_recipe
+                    FROM instagram_users
+                    WHERE sender_id = %s
+                    """,
+                    (sender_id,)
+                )
+
+                fila = cur.fetchone()
+
+            conn.commit()
+
+        if not fila:
+            return {
+                "free_recipe_used": False,
+                "paid_access": False,
+                "last_recipe": None
+            }
+
+        return {
+            "free_recipe_used": bool(fila[0]),
+            "paid_access": bool(fila[1]),
+            "last_recipe": fila[2]
+        }
+
+    except Exception as e:
+        print("ERROR OBTENIENDO USUARIO DB:", str(e))
+
+        # En caso de error de base de datos no regalamos
+        # recetas ilimitadas accidentalmente.
+        return None
+
+
+def marcar_receta_gratuita_usada(sender_id, receta):
+    try:
+        with obtener_conexion_db() as conn:
+            with conn.cursor() as cur:
+
+                cur.execute(
+                    """
+                    INSERT INTO instagram_users (
+                        sender_id,
+                        free_recipe_used,
+                        last_recipe,
+                        updated_at
+                    )
+                    VALUES (%s, TRUE, %s, NOW())
+
+                    ON CONFLICT (sender_id)
+                    DO UPDATE SET
+                        free_recipe_used = TRUE,
+                        last_recipe = EXCLUDED.last_recipe,
+                        updated_at = NOW()
+                    """,
+                    (
+                        sender_id,
+                        receta
+                    )
+                )
+
+            conn.commit()
+
+        print("Receta gratuita registrada para:", sender_id)
+
+    except Exception as e:
+        print("ERROR REGISTRANDO RECETA GRATUITA:", str(e))
+
+
+def actualizar_ultima_receta(sender_id, receta):
+    try:
+        with obtener_conexion_db() as conn:
+            with conn.cursor() as cur:
+
+                cur.execute(
+                    """
+                    UPDATE instagram_users
+                    SET
+                        last_recipe = %s,
+                        updated_at = NOW()
+                    WHERE sender_id = %s
+                    """,
+                    (
+                        receta,
+                        sender_id
+                    )
+                )
+
+            conn.commit()
+
+    except Exception as e:
+        print("ERROR ACTUALIZANDO RECETA:", str(e))
 
 
 # --------------------------------------------------
@@ -21,13 +180,15 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # --------------------------------------------------
 
 # Esta memoria vive solamente dentro del proceso de Railway.
-# No utiliza una base de datos permanente.
+# PostgreSQL se utiliza para conservar permanentemente
+# el estado de la receta gratuita.
+
 memoria_conversaciones = {}
 
 # 60 minutos
 MEMORIA_DURACION = 60 * 60
 
-# Máximo de mensajes anteriores que se enviarán como contexto
+# Máximo de mensajes anteriores enviados como contexto
 MAX_MENSAJES_MEMORIA = 6
 
 
@@ -42,7 +203,6 @@ def obtener_memoria(sender_id):
 
     ultima_actividad = datos.get("ultima_actividad", 0)
 
-    # Si pasó más de una hora, olvidar la conversación
     if ahora - ultima_actividad > MEMORIA_DURACION:
         memoria_conversaciones.pop(sender_id, None)
         return []
@@ -69,7 +229,6 @@ def guardar_en_memoria(sender_id, rol, contenido):
         }
     )
 
-    # Conservar únicamente los mensajes más recientes
     datos["mensajes"] = datos["mensajes"][-MAX_MENSAJES_MEMORIA:]
 
     datos["ultima_actividad"] = ahora
@@ -83,7 +242,7 @@ def limpiar_memorias_expiradas():
 
     expiradas = []
 
-    for sender_id, datos in memoria_conversaciones.items():
+    for sender_id, datos in list(memoria_conversaciones.items()):
 
         ultima_actividad = datos.get("ultima_actividad", 0)
 
@@ -92,6 +251,132 @@ def limpiar_memorias_expiradas():
 
     for sender_id in expiradas:
         memoria_conversaciones.pop(sender_id, None)
+
+
+# --------------------------------------------------
+# DETECTAR SI LA RESPUESTA ES UNA RECETA COMPLETA
+# --------------------------------------------------
+
+def es_receta_completa(texto):
+
+    texto_normalizado = texto.lower()
+
+    tiene_ingredientes = "ingredientes" in texto_normalizado
+
+    tiene_preparacion = (
+        "preparación" in texto_normalizado
+        or "preparacion" in texto_normalizado
+    )
+
+    return (
+        tiene_ingredientes
+        and tiene_preparacion
+        and len(texto.strip()) >= 150
+    )
+
+
+# --------------------------------------------------
+# CLASIFICAR MENSAJE DESPUES DE LA RECETA GRATIS
+# --------------------------------------------------
+
+def clasificar_mensaje_posterior(
+    mensaje_usuario,
+    historial,
+    ultima_receta
+):
+
+    try:
+
+        contexto = ""
+
+        for mensaje in historial[-4:]:
+            contexto += (
+                f'{mensaje["role"]}: '
+                f'{mensaje["content"]}\n'
+            )
+
+        ultima_receta_texto = ultima_receta or "No disponible"
+
+        instrucciones = """
+Clasifica el mensaje actual de una persona que ya recibió
+una receta personalizada gratuita.
+
+Debes responder ÚNICAMENTE con una de estas tres palabras:
+
+AJUSTE
+NUEVA
+OTRO
+
+AJUSTE:
+La persona quiere modificar, sustituir, quitar, agregar,
+aclarar o adaptar algo de la MISMA receta que ya recibió.
+
+Ejemplos:
+- no quiero tomate
+- cambia el aguacate
+- no tengo cebolla
+- ¿puedo usar otra verdura?
+- hazla para 4 personas
+- ¿puedo hacerla sin lácteos?
+- ¿cuánto tiempo cocino el pollo?
+- explícame mejor el paso 2
+
+NUEVA:
+La persona solicita otra receta, otro plato, otra comida,
+otro desayuno, almuerzo, cena, snack, postre, menú o una
+preparación diferente.
+
+Ejemplos:
+- dame otra receta
+- quiero otra cena
+- ahora dame un desayuno
+- quiero algo con pescado
+- dame un postre
+- hazme otra opción
+- dame una receta diferente
+
+OTRO:
+Saludos, agradecimientos, conversación general, preguntas
+que no solicitan una nueva receta completa, o temas que no
+corresponden claramente a AJUSTE o NUEVA.
+
+No expliques tu decisión.
+"""
+
+        entrada = f"""
+RECETA ANTERIOR:
+{ultima_receta_texto}
+
+CONTEXTO RECIENTE:
+{contexto}
+
+MENSAJE ACTUAL:
+{mensaje_usuario}
+"""
+
+        response = client.responses.create(
+            model="gpt-5.6-luna",
+            instructions=instrucciones,
+            input=entrada
+        )
+
+        clasificacion = response.output_text.strip().upper()
+
+        if clasificacion.startswith("AJUSTE"):
+            return "AJUSTE"
+
+        if clasificacion.startswith("NUEVA"):
+            return "NUEVA"
+
+        return "OTRO"
+
+    except Exception as e:
+
+        print("ERROR CLASIFICANDO MENSAJE:", str(e))
+
+        # Ante una falla no generamos automáticamente
+        # otra receta gratuita.
+        return "OTRO"
 
 
 # --------------------------------------------------
@@ -164,6 +449,28 @@ No conviertas la conversación en un cuestionario.
 
 Después de que la persona responda tus preguntas, utiliza esas respuestas
 para crear la receta. No vuelvas a iniciar otra ronda de preguntas.
+
+
+AJUSTES A UNA RECETA YA ENTREGADA:
+
+Si la persona está haciendo un pequeño cambio o sustitución a una receta
+que acaba de recibir, responde específicamente al cambio solicitado.
+
+Por ejemplo:
+- quitar un ingrediente
+- cambiar una verdura
+- sustituir un ingrediente
+- cambiar cantidades
+- adaptar el número de porciones
+- aclarar un paso de preparación
+
+Para cambios pequeños, no es necesario volver a escribir toda la receta.
+
+Explica únicamente qué debe cambiar y, cuando sea útil, cómo afecta
+la preparación.
+
+Si la persona pide explícitamente que vuelvas a escribir la receta completa
+con los cambios, puedes hacerlo.
 
 
 USA EL CONOCIMIENTO DISPONIBLE PARA:
@@ -322,6 +629,19 @@ Cuéntame qué buscas y con gusto te ayudo."
 
 
 # --------------------------------------------------
+# MENSAJE DE LIMITE GRATUITO
+# --------------------------------------------------
+
+MENSAJE_LIMITE_GRATUITO = """
+Ya utilizaste tu receta personalizada gratuita 🌿
+
+Puedo seguir ayudándote con cambios, sustituciones o dudas sobre esa misma receta.
+
+Las recetas personalizadas nuevas forman parte del acceso de Comida Saludable GT.
+""".strip()
+
+
+# --------------------------------------------------
 # PAGINA PRINCIPAL
 # --------------------------------------------------
 
@@ -375,8 +695,9 @@ def privacy():
 
         <p>
         Utilizamos esta información para responder mensajes, brindar
-        información solicitada y operar las funciones automatizadas
-        de Comida Saludable GT.
+        información solicitada, recordar el estado de acceso a funciones
+        del servicio y operar las funciones automatizadas de
+        Comida Saludable GT.
         </p>
 
         <h2>Compartición de información</h2>
@@ -411,6 +732,53 @@ def privacy():
 # GENERAR RESPUESTA CON OPENAI + FILE SEARCH + MEMORIA
 # --------------------------------------------------
 
+def generar_respuesta_normal(
+    sender_id,
+    mensaje_usuario,
+    historial
+):
+
+    mensajes = []
+
+    for mensaje in historial:
+        mensajes.append(
+            {
+                "role": mensaje["role"],
+                "content": mensaje["content"]
+            }
+        )
+
+    mensajes.append(
+        {
+            "role": "user",
+            "content": mensaje_usuario
+        }
+    )
+
+    response = client.responses.create(
+        model="gpt-5.6-luna",
+        instructions=SYSTEM_PROMPT,
+        input=mensajes,
+        tools=[
+            {
+                "type": "file_search",
+                "vector_store_ids": [VECTOR_STORE_ID],
+                "max_num_results": 5
+            }
+        ]
+    )
+
+    respuesta = response.output_text.strip()
+
+    if not respuesta:
+        respuesta = (
+            "¡Hola! 👋 Cuéntame qué te gustaría preparar: "
+            "una receta, un postre, un snack o un menú saludable."
+        )
+
+    return respuesta
+
+
 def generar_respuesta(sender_id, mensaje_usuario):
 
     try:
@@ -419,43 +787,99 @@ def generar_respuesta(sender_id, mensaje_usuario):
 
         historial = obtener_memoria(sender_id)
 
-        mensajes = []
+        usuario = obtener_usuario_db(sender_id)
 
-        for mensaje in historial:
-            mensajes.append(
-                {
-                    "role": mensaje["role"],
-                    "content": mensaje["content"]
-                }
-            )
+        # Si PostgreSQL no está disponible, evitamos entregar
+        # recetas ilimitadas accidentalmente.
+        if usuario is None:
 
-        mensajes.append(
-            {
-                "role": "user",
-                "content": mensaje_usuario
-            }
-        )
-
-        response = client.responses.create(
-            model="gpt-5.6-luna",
-            instructions=SYSTEM_PROMPT,
-            input=mensajes,
-            tools=[
-                {
-                    "type": "file_search",
-                    "vector_store_ids": [VECTOR_STORE_ID],
-                    "max_num_results": 5
-                }
-            ]
-        )
-
-        respuesta = response.output_text.strip()
-
-        if not respuesta:
             respuesta = (
-                "¡Hola! 👋 Cuéntame qué te gustaría preparar: "
-                "una receta, un postre, un snack o un menú saludable."
+                "Gracias por escribirnos 🌿. "
+                "En este momento tuve un pequeño inconveniente para "
+                "consultar tu acceso. Inténtalo nuevamente en unos minutos."
             )
+
+            return respuesta
+
+        free_recipe_used = usuario["free_recipe_used"]
+        paid_access = usuario["paid_access"]
+        ultima_receta = usuario["last_recipe"]
+
+        # --------------------------------------------------
+        # USUARIO QUE YA UTILIZO SU RECETA GRATIS
+        # --------------------------------------------------
+
+        if free_recipe_used and not paid_access:
+
+            clasificacion = clasificar_mensaje_posterior(
+                mensaje_usuario,
+                historial,
+                ultima_receta
+            )
+
+            print(
+                "Clasificación usuario con receta usada:",
+                clasificacion
+            )
+
+            # Solicita una receta completamente nueva
+            if clasificacion == "NUEVA":
+
+                guardar_en_memoria(
+                    sender_id,
+                    "user",
+                    mensaje_usuario
+                )
+
+                guardar_en_memoria(
+                    sender_id,
+                    "assistant",
+                    MENSAJE_LIMITE_GRATUITO
+                )
+
+                return MENSAJE_LIMITE_GRATUITO
+
+            # AJUSTE u OTRO pueden continuar normalmente.
+            respuesta = generar_respuesta_normal(
+                sender_id,
+                mensaje_usuario,
+                historial
+            )
+
+            guardar_en_memoria(
+                sender_id,
+                "user",
+                mensaje_usuario
+            )
+
+            guardar_en_memoria(
+                sender_id,
+                "assistant",
+                respuesta
+            )
+
+            # Si fue un ajuste y el modelo reescribió
+            # una receta completa, guardamos la versión nueva.
+            if (
+                clasificacion == "AJUSTE"
+                and es_receta_completa(respuesta)
+            ):
+                actualizar_ultima_receta(
+                    sender_id,
+                    respuesta
+                )
+
+            return respuesta
+
+        # --------------------------------------------------
+        # USUARIO NUEVO O USUARIO CON ACCESO PAGADO
+        # --------------------------------------------------
+
+        respuesta = generar_respuesta_normal(
+            sender_id,
+            mensaje_usuario,
+            historial
+        )
 
         guardar_en_memoria(
             sender_id,
@@ -469,16 +893,31 @@ def generar_respuesta(sender_id, mensaje_usuario):
             respuesta
         )
 
+        # Los usuarios con acceso pagado no consumen
+        # la lógica de la receta gratuita.
+        if paid_access:
+            return respuesta
+
+        # Solo marcamos la receta gratis cuando realmente
+        # se entregó una receta completa.
+        # Las preguntas previas NO consumen la receta.
+        if es_receta_completa(respuesta):
+
+            marcar_receta_gratuita_usada(
+                sender_id,
+                respuesta
+            )
+
         return respuesta
 
     except Exception as e:
 
-        print("ERROR OPENAI:", str(e))
+        print("ERROR GENERANDO RESPUESTA:", str(e))
 
         return (
             "Gracias por escribirnos 🌿. "
             "En este momento tuve un pequeño inconveniente para responder. "
-            "Cuéntame qué tipo de receta estás buscando."
+            "Inténtalo nuevamente en unos minutos."
         )
 
 
@@ -653,6 +1092,13 @@ def webhook():
         print("ERROR PROCESANDO WEBHOOK:", str(e))
 
     return "EVENT_RECEIVED", 200
+
+
+# --------------------------------------------------
+# INICIALIZAR POSTGRESQL
+# --------------------------------------------------
+
+inicializar_base_datos()
 
 
 # --------------------------------------------------
