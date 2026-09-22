@@ -1,9 +1,10 @@
 import os
 import time
+import secrets
 import requests
 import psycopg
 
-from flask import Flask, request
+from flask import Flask, request, send_file, abort
 from openai import OpenAI
 
 
@@ -18,6 +19,30 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 INSTAGRAM_ACCESS_TOKEN = os.environ.get("INSTAGRAM_ACCESS_TOKEN", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+# Telegram privado del administrador.
+# Se configurarán después directamente en Railway.
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID", "")
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+
+# URL pública de este servicio en Railway.
+PUBLIC_BASE_URL = os.environ.get(
+    "PUBLIC_BASE_URL",
+    "https://comida-saludable-gt-production.up.railway.app"
+).rstrip("/")
+
+# RESET DULCE
+RESET_DULCE_PAYMENT_URL = (
+    "https://app.recurrente.com/s/steeven-gil/o/reset-dulce-ebook-digital"
+)
+RESET_DULCE_PRICE = "Q60"
+
+# Cuando creemos el Volume de Railway, montaremos el PDF en esta ruta.
+RESET_DULCE_PDF_PATH = os.environ.get(
+    "RESET_DULCE_PDF_PATH",
+    "/data/RESET_DULCE.pdf"
+)
 
 
 # Biblioteca privada de Comida Saludable GT
@@ -56,6 +81,39 @@ def inicializar_base_datos():
                     """
                 )
 
+                # RESET DULCE se maneja aparte del límite de receta gratuita.
+                # Comprar el ebook NO habilita recetas ilimitadas.
+                cur.execute(
+                    """
+                    ALTER TABLE instagram_users
+                    ADD COLUMN IF NOT EXISTS reset_dulce_purchased
+                    BOOLEAN NOT NULL DEFAULT FALSE
+                    """
+                )
+
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS reset_dulce_orders (
+                        id BIGSERIAL PRIMARY KEY,
+                        sender_id TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        receipt_url TEXT,
+                        download_token TEXT UNIQUE,
+                        download_used BOOLEAN NOT NULL DEFAULT FALSE,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        reviewed_at TIMESTAMPTZ,
+                        downloaded_at TIMESTAMPTZ
+                    )
+                    """
+                )
+
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_reset_orders_sender
+                    ON reset_dulce_orders (sender_id)
+                    """
+                )
+
             conn.commit()
 
         print("Base de datos PostgreSQL inicializada correctamente")
@@ -83,7 +141,8 @@ def obtener_usuario_db(sender_id):
                     SELECT
                         free_recipe_used,
                         paid_access,
-                        last_recipe
+                        last_recipe,
+                        reset_dulce_purchased
                     FROM instagram_users
                     WHERE sender_id = %s
                     """,
@@ -98,13 +157,15 @@ def obtener_usuario_db(sender_id):
             return {
                 "free_recipe_used": False,
                 "paid_access": False,
-                "last_recipe": None
+                "last_recipe": None,
+                "reset_dulce_purchased": False
             }
 
         return {
             "free_recipe_used": bool(fila[0]),
             "paid_access": bool(fila[1]),
-            "last_recipe": fila[2]
+            "last_recipe": fila[2],
+            "reset_dulce_purchased": bool(fila[3])
         }
 
     except Exception as e:
@@ -173,6 +234,370 @@ def actualizar_ultima_receta(sender_id, receta):
 
     except Exception as e:
         print("ERROR ACTUALIZANDO RECETA:", str(e))
+
+
+# --------------------------------------------------
+# RESET DULCE: PEDIDOS, COMPROBANTES Y DESCARGAS
+# --------------------------------------------------
+
+def obtener_ultimo_pedido_reset(sender_id):
+    try:
+        with obtener_conexion_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, status, receipt_url, download_token, download_used
+                    FROM reset_dulce_orders
+                    WHERE sender_id = %s
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (sender_id,)
+                )
+                fila = cur.fetchone()
+
+        if not fila:
+            return None
+
+        return {
+            "id": fila[0],
+            "status": fila[1],
+            "receipt_url": fila[2],
+            "download_token": fila[3],
+            "download_used": bool(fila[4])
+        }
+
+    except Exception as e:
+        print("ERROR OBTENIENDO PEDIDO RESET DULCE:", str(e))
+        return None
+
+
+def crear_o_actualizar_pedido_pendiente(sender_id, receipt_url):
+    try:
+        with obtener_conexion_db() as conn:
+            with conn.cursor() as cur:
+
+                cur.execute(
+                    """
+                    SELECT id
+                    FROM reset_dulce_orders
+                    WHERE sender_id = %s
+                      AND status = 'pending'
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (sender_id,)
+                )
+                fila = cur.fetchone()
+
+                if fila:
+                    order_id = fila[0]
+                    cur.execute(
+                        """
+                        UPDATE reset_dulce_orders
+                        SET receipt_url = %s,
+                            created_at = NOW()
+                        WHERE id = %s
+                        """,
+                        (receipt_url, order_id)
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO reset_dulce_orders (
+                            sender_id,
+                            status,
+                            receipt_url
+                        )
+                        VALUES (%s, 'pending', %s)
+                        RETURNING id
+                        """,
+                        (sender_id, receipt_url)
+                    )
+                    order_id = cur.fetchone()[0]
+
+            conn.commit()
+
+        return order_id
+
+    except Exception as e:
+        print("ERROR CREANDO PEDIDO PENDIENTE:", str(e))
+        return None
+
+
+def aprobar_pedido_reset(order_id):
+    token = secrets.token_urlsafe(32)
+
+    try:
+        with obtener_conexion_db() as conn:
+            with conn.cursor() as cur:
+
+                cur.execute(
+                    """
+                    SELECT sender_id, status
+                    FROM reset_dulce_orders
+                    WHERE id = %s
+                    FOR UPDATE
+                    """,
+                    (order_id,)
+                )
+                fila = cur.fetchone()
+
+                if not fila:
+                    return None
+
+                sender_id, status = fila
+
+                if status == "approved":
+                    cur.execute(
+                        """
+                        SELECT download_token
+                        FROM reset_dulce_orders
+                        WHERE id = %s
+                        """,
+                        (order_id,)
+                    )
+                    token_existente = cur.fetchone()[0]
+                    return {
+                        "sender_id": sender_id,
+                        "token": token_existente,
+                        "already_approved": True
+                    }
+
+                if status != "pending":
+                    return None
+
+                cur.execute(
+                    """
+                    UPDATE reset_dulce_orders
+                    SET status = 'approved',
+                        download_token = %s,
+                        download_used = FALSE,
+                        reviewed_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (token, order_id)
+                )
+
+                cur.execute(
+                    """
+                    UPDATE instagram_users
+                    SET reset_dulce_purchased = TRUE,
+                        updated_at = NOW()
+                    WHERE sender_id = %s
+                    """,
+                    (sender_id,)
+                )
+
+            conn.commit()
+
+        return {
+            "sender_id": sender_id,
+            "token": token,
+            "already_approved": False
+        }
+
+    except Exception as e:
+        print("ERROR APROBANDO PEDIDO:", str(e))
+        return None
+
+
+def rechazar_pedido_reset(order_id):
+    try:
+        with obtener_conexion_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE reset_dulce_orders
+                    SET status = 'rejected',
+                        reviewed_at = NOW()
+                    WHERE id = %s
+                      AND status = 'pending'
+                    RETURNING sender_id
+                    """,
+                    (order_id,)
+                )
+                fila = cur.fetchone()
+
+            conn.commit()
+
+        if not fila:
+            return None
+
+        return fila[0]
+
+    except Exception as e:
+        print("ERROR RECHAZANDO PEDIDO:", str(e))
+        return None
+
+
+def consumir_token_descarga(token):
+    try:
+        with obtener_conexion_db() as conn:
+            with conn.cursor() as cur:
+
+                cur.execute(
+                    """
+                    SELECT id, download_used, status
+                    FROM reset_dulce_orders
+                    WHERE download_token = %s
+                    FOR UPDATE
+                    """,
+                    (token,)
+                )
+                fila = cur.fetchone()
+
+                if not fila:
+                    return False, "invalid"
+
+                order_id, download_used, status = fila
+
+                if status != "approved":
+                    return False, "not_approved"
+
+                if download_used:
+                    return False, "used"
+
+                cur.execute(
+                    """
+                    UPDATE reset_dulce_orders
+                    SET download_used = TRUE,
+                        downloaded_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (order_id,)
+                )
+
+            conn.commit()
+
+        return True, "ok"
+
+    except Exception as e:
+        print("ERROR CONSUMIENDO TOKEN:", str(e))
+        return False, "error"
+
+
+def enviar_telegram_texto(texto, reply_markup=None):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_CHAT_ID:
+        print("Telegram todavía no está configurado")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    payload = {
+        "chat_id": TELEGRAM_ADMIN_CHAT_ID,
+        "text": texto
+    }
+
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    try:
+        response = requests.post(url, json=payload, timeout=15)
+        print("Telegram sendMessage:", response.status_code, response.text)
+        return response.ok
+    except Exception as e:
+        print("ERROR TELEGRAM TEXTO:", str(e))
+        return False
+
+
+def enviar_comprobante_a_telegram(order_id, sender_id, receipt_url):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_CHAT_ID:
+        print("Telegram todavía no está configurado")
+        return False
+
+    botones = {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "✅ APROBAR",
+                    "callback_data": f"approve:{order_id}"
+                },
+                {
+                    "text": "❌ RECHAZAR",
+                    "callback_data": f"reject:{order_id}"
+                }
+            ]
+        ]
+    }
+
+    caption = (
+        "🛒 NUEVA COMPRA — RESET DULCE\n"
+        f"Pedido: #{order_id}\n"
+        f"Instagram ID: {sender_id}\n"
+        f"Precio: {RESET_DULCE_PRICE}\n\n"
+        "Revisa el comprobante y decide:"
+    )
+
+    # Primero intentamos que Telegram cargue directamente la imagen.
+    url_photo = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+
+    payload_photo = {
+        "chat_id": TELEGRAM_ADMIN_CHAT_ID,
+        "photo": receipt_url,
+        "caption": caption,
+        "reply_markup": botones
+    }
+
+    try:
+        response = requests.post(url_photo, json=payload_photo, timeout=20)
+
+        if response.ok:
+            print("Comprobante enviado a Telegram")
+            return True
+
+        print(
+            "Telegram no pudo cargar la foto directamente:",
+            response.status_code,
+            response.text
+        )
+
+    except Exception as e:
+        print("ERROR TELEGRAM FOTO:", str(e))
+
+    # Respaldo: mandamos aviso y botones aunque la foto no pueda cargarse.
+    texto = (
+        caption
+        + "\n\nNo pude cargar automáticamente la imagen en Telegram. "
+        + "Puedes revisar el comprobante en la conversación de Instagram."
+    )
+
+    return enviar_telegram_texto(texto, botones)
+
+
+def responder_callback_telegram(callback_query_id, texto):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+
+    try:
+        requests.post(
+            url,
+            json={
+                "callback_query_id": callback_query_id,
+                "text": texto
+            },
+            timeout=10
+        )
+    except Exception as e:
+        print("ERROR RESPONDIENDO CALLBACK TELEGRAM:", str(e))
+
+
+def extraer_url_imagen_instagram(message):
+    attachments = message.get("attachments") or []
+
+    for attachment in attachments:
+        if attachment.get("type") != "image":
+            continue
+
+        payload = attachment.get("payload") or {}
+        url = payload.get("url")
+
+        if url:
+            return url
+
+    return None
 
 
 # --------------------------------------------------
@@ -632,12 +1057,20 @@ Cuéntame qué buscas y con gusto te ayudo."
 # MENSAJE DE LIMITE GRATUITO
 # --------------------------------------------------
 
-MENSAJE_LIMITE_GRATUITO = """
+MENSAJE_LIMITE_GRATUITO = f"""
 Ya utilizaste tu receta personalizada gratuita 🌿
 
 Puedo seguir ayudándote con cambios, sustituciones o dudas sobre esa misma receta.
 
-Las recetas personalizadas nuevas forman parte del acceso de Comida Saludable GT.
+Si quieres seguir descubriendo opciones saludables, tenemos RESET DULCE 📕
+Una guía digital de 2 semanas con recetas, menús, sustituciones, meal prep, salsas y lista de compras.
+
+Precio: {RESET_DULCE_PRICE}
+
+Puedes comprarla aquí:
+{RESET_DULCE_PAYMENT_URL}
+
+Después de pagar, vuelve a este chat y envíame una captura de tu comprobante 📸
 """.strip()
 
 
@@ -809,7 +1242,7 @@ def generar_respuesta(sender_id, mensaje_usuario):
         # USUARIO QUE YA UTILIZO SU RECETA GRATIS
         # --------------------------------------------------
 
-        if free_recipe_used and not paid_access:
+        if free_recipe_used:
 
             clasificacion = clasificar_mensaje_posterior(
                 mensaje_usuario,
@@ -893,10 +1326,9 @@ def generar_respuesta(sender_id, mensaje_usuario):
             respuesta
         )
 
-        # Los usuarios con acceso pagado no consumen
-        # la lógica de la receta gratuita.
-        if paid_access:
-            return respuesta
+        # RESET DULCE no da acceso a recetas personalizadas adicionales.
+        # paid_access se conserva en la tabla por compatibilidad histórica,
+        # pero no evita el límite de una receta gratuita.
 
         # Solo marcamos la receta gratis cuando realmente
         # se entregó una receta completa.
@@ -1014,6 +1446,142 @@ def enviar_mensaje_instagram(recipient_id, texto):
 
 
 # --------------------------------------------------
+# DESCARGA UNICA DE RESET DULCE
+# --------------------------------------------------
+
+@app.route("/descargar/reset-dulce/<token>", methods=["GET"])
+def descargar_reset_dulce(token):
+
+    if not os.path.isfile(RESET_DULCE_PDF_PATH):
+        print("PDF RESET DULCE no encontrado:", RESET_DULCE_PDF_PATH)
+        return (
+            "El archivo todavía no está disponible. "
+            "Por favor comunícate con Comida Saludable GT.",
+            503
+        )
+
+    valido, motivo = consumir_token_descarga(token)
+
+    if not valido:
+        if motivo == "used":
+            return (
+                "Este enlace de descarga ya fue utilizado. "
+                "Si necesitas ayuda, escríbenos por Instagram.",
+                410
+            )
+
+        abort(404)
+
+    return send_file(
+        RESET_DULCE_PDF_PATH,
+        as_attachment=True,
+        download_name="RESET_DULCE_Comida_Saludable_GT.pdf",
+        mimetype="application/pdf"
+    )
+
+
+# --------------------------------------------------
+# WEBHOOK PRIVADO DE TELEGRAM
+# --------------------------------------------------
+
+@app.route("/telegram/webhook/<secret>", methods=["POST"])
+def telegram_webhook(secret):
+
+    if not TELEGRAM_WEBHOOK_SECRET or secret != TELEGRAM_WEBHOOK_SECRET:
+        return "NO AUTORIZADO", 403
+
+    data = request.get_json(silent=True) or {}
+    callback = data.get("callback_query")
+
+    if not callback:
+        return "OK", 200
+
+    callback_id = callback.get("id")
+    callback_data = callback.get("data", "")
+
+    from_user = callback.get("from") or {}
+    chat_id = str(from_user.get("id", ""))
+
+    # Solo tú puedes usar los botones de aprobación.
+    if str(TELEGRAM_ADMIN_CHAT_ID) != chat_id:
+        responder_callback_telegram(
+            callback_id,
+            "No tienes permiso para aprobar esta compra."
+        )
+        return "OK", 200
+
+    try:
+        accion, order_id_texto = callback_data.split(":", 1)
+        order_id = int(order_id_texto)
+    except Exception:
+        responder_callback_telegram(callback_id, "Solicitud inválida.")
+        return "OK", 200
+
+    if accion == "approve":
+
+        resultado = aprobar_pedido_reset(order_id)
+
+        if not resultado:
+            responder_callback_telegram(
+                callback_id,
+                "No pude aprobar este pedido."
+            )
+            return "OK", 200
+
+        sender_id = resultado["sender_id"]
+        token = resultado["token"]
+
+        enlace = f"{PUBLIC_BASE_URL}/descargar/reset-dulce/{token}"
+
+        mensaje_cliente = (
+            "✅ ¡Tu pago fue confirmado! 🌿\n\n"
+            "Gracias por comprar RESET DULCE.\n\n"
+            "📕 Descarga tu ebook aquí:\n"
+            f"{enlace}\n\n"
+            "Este enlace es personal y permite una sola descarga. "
+            "Guarda el PDF después de descargarlo."
+        )
+
+        enviar_mensaje_instagram(sender_id, mensaje_cliente)
+
+        responder_callback_telegram(
+            callback_id,
+            "✅ Compra aprobada y enlace enviado."
+        )
+
+        return "OK", 200
+
+    if accion == "reject":
+
+        sender_id = rechazar_pedido_reset(order_id)
+
+        if not sender_id:
+            responder_callback_telegram(
+                callback_id,
+                "Este pedido ya fue procesado o no existe."
+            )
+            return "OK", 200
+
+        mensaje_cliente = (
+            "No pudimos confirmar el comprobante enviado. 🌿\n\n"
+            "Por favor revisa que corresponda al pago de RESET DULCE "
+            f"por {RESET_DULCE_PRICE} y envía nuevamente una captura clara."
+        )
+
+        enviar_mensaje_instagram(sender_id, mensaje_cliente)
+
+        responder_callback_telegram(
+            callback_id,
+            "❌ Comprobante rechazado. Se avisó al cliente."
+        )
+
+        return "OK", 200
+
+    responder_callback_telegram(callback_id, "Acción desconocida.")
+    return "OK", 200
+
+
+# --------------------------------------------------
 # WEBHOOK META / INSTAGRAM
 # --------------------------------------------------
 
@@ -1059,33 +1627,91 @@ def webhook():
                     print("Echo ignorado correctamente")
                     continue
 
-                texto_usuario = message.get("text")
-
-                # Por ahora ignoramos fotos, audios, stickers, etc.
-                if not texto_usuario:
-                    print("Mensaje sin texto ignorado")
-                    continue
-
                 sender = event.get("sender", {})
                 sender_id = sender.get("id")
 
                 if not sender_id:
                     continue
 
-                print("Mensaje recibido:", texto_usuario)
-                print("Sender ID:", sender_id)
+                texto_usuario = message.get("text")
+                imagen_url = extraer_url_imagen_instagram(message)
 
-                respuesta_ia = generar_respuesta(
-                    sender_id,
-                    texto_usuario
-                )
+                # --------------------------------------------------
+                # COMPROBANTE DE PAGO ENVIADO COMO IMAGEN
+                # --------------------------------------------------
+                if imagen_url:
 
-                print("Respuesta IA:", respuesta_ia)
+                    usuario = obtener_usuario_db(sender_id)
 
-                enviar_mensaje_instagram(
-                    sender_id,
-                    respuesta_ia
-                )
+                    if usuario is None:
+                        enviar_mensaje_instagram(
+                            sender_id,
+                            "Recibí tu imagen 🌿, pero tuve un inconveniente "
+                            "para registrar la solicitud. Inténtalo nuevamente "
+                            "en unos minutos."
+                        )
+                        continue
+
+                    # Si ya compró RESET DULCE, no creamos otra compra.
+                    if usuario.get("reset_dulce_purchased"):
+                        enviar_mensaje_instagram(
+                            sender_id,
+                            "Tu compra de RESET DULCE ya fue aprobada 🌿. "
+                            "Si necesitas ayuda con tu descarga, escríbenos aquí."
+                        )
+                        continue
+
+                    order_id = crear_o_actualizar_pedido_pendiente(
+                        sender_id,
+                        imagen_url
+                    )
+
+                    if not order_id:
+                        enviar_mensaje_instagram(
+                            sender_id,
+                            "Recibí tu comprobante 🌿, pero tuve un inconveniente "
+                            "para registrarlo. Por favor intenta enviarlo nuevamente."
+                        )
+                        continue
+
+                    enviar_mensaje_instagram(
+                        sender_id,
+                        "¡Gracias! 🌿 Recibimos tu comprobante de pago.\n\n"
+                        "Estamos validando tu compra. En cuanto sea confirmada, "
+                        "recibirás aquí mismo tu acceso a RESET DULCE."
+                    )
+
+                    enviar_comprobante_a_telegram(
+                        order_id,
+                        sender_id,
+                        imagen_url
+                    )
+
+                    continue
+
+                # --------------------------------------------------
+                # MENSAJE DE TEXTO NORMAL
+                # --------------------------------------------------
+                if texto_usuario:
+
+                    print("Mensaje recibido:", texto_usuario)
+                    print("Sender ID:", sender_id)
+
+                    respuesta_ia = generar_respuesta(
+                        sender_id,
+                        texto_usuario
+                    )
+
+                    print("Respuesta IA:", respuesta_ia)
+
+                    enviar_mensaje_instagram(
+                        sender_id,
+                        respuesta_ia
+                    )
+
+                    continue
+
+                print("Mensaje sin texto o imagen ignorado")
 
     except Exception as e:
 
