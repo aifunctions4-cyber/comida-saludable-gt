@@ -1491,6 +1491,45 @@ def telegram_webhook(secret):
         return "NO AUTORIZADO", 403
 
     data = request.get_json(silent=True) or {}
+
+    # --------------------------------------------------
+    # MENSAJES NORMALES DEL ADMINISTRADOR EN TELEGRAM
+    # --------------------------------------------------
+    telegram_message = data.get("message") or data.get("edited_message")
+
+    if telegram_message:
+        chat = telegram_message.get("chat") or {}
+        from_user = telegram_message.get("from") or {}
+        chat_id = str(chat.get("id", ""))
+        from_user_id = str(from_user.get("id", ""))
+        texto = (telegram_message.get("text") or "").strip()
+
+        # El bot privado solamente responde al administrador configurado.
+        if (
+            str(TELEGRAM_ADMIN_CHAT_ID) != chat_id
+            or str(TELEGRAM_ADMIN_CHAT_ID) != from_user_id
+        ):
+            return "OK", 200
+
+        if texto.startswith("/start"):
+            enviar_telegram_texto(
+                "✅ Comida Saludable GT Pagos está conectado correctamente.\n\n"
+                "Cuando un cliente envíe por Instagram una captura de su "
+                "comprobante de RESET DULCE, recibirás aquí el aviso con "
+                "los botones APROBAR y RECHAZAR."
+            )
+        elif texto:
+            enviar_telegram_texto(
+                "🌿 Bot de pagos activo.\n\n"
+                "No necesitas escribir comandos. Cuando llegue un comprobante "
+                "desde Instagram, aparecerá aquí para revisarlo."
+            )
+
+        return "OK", 200
+
+    # --------------------------------------------------
+    # BOTONES APROBAR / RECHAZAR
+    # --------------------------------------------------
     callback = data.get("callback_query")
 
     if not callback:
