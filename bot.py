@@ -1,96 +1,109 @@
-import os
-import time
-import secrets
-import requests
-import psycopg
+                if not sender_id:
+                    continue
 
-from flask import Flask, request, send_file, abort
-from openai import OpenAI
+                texto_usuario = message.get("text")
+                imagen_url = extraer_url_imagen_instagram(message)
 
+                # --------------------------------------------------
+                # COMPROBANTE DE PAGO ENVIADO COMO IMAGEN
+                # --------------------------------------------------
+                if imagen_url:
 
-app = Flask(__name__)
+                    usuario = obtener_usuario_db(sender_id)
 
+                    if usuario is None:
+                        enviar_mensaje_instagram(
+                            sender_id,
+                            "Recibí tu imagen 🌿, pero tuve un inconveniente "
+                            "para registrar la solicitud. Inténtalo nuevamente "
+                            "en unos minutos."
+                        )
+                        continue
 
-# --------------------------------------------------
-# VARIABLES DE ENTORNO
-# --------------------------------------------------
+                    # Si ya compró RESET DULCE, no creamos otra compra.
+                    if usuario.get("reset_dulce_purchased"):
+                        enviar_mensaje_instagram(
+                            sender_id,
+                            "Tu compra de RESET DULCE ya fue aprobada 🌿. "
+                            "Si necesitas ayuda con tu descarga, escríbenos aquí."
+                        )
+                        continue
 
-VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
-INSTAGRAM_ACCESS_TOKEN = os.environ.get("INSTAGRAM_ACCESS_TOKEN", "")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-
-# Telegram privado del administrador.
-# Se configurarán después directamente en Railway.
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID", "")
-TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
-
-# URL pública de este servicio en Railway.
-PUBLIC_BASE_URL = os.environ.get(
-    "PUBLIC_BASE_URL",
-    "https://comida-saludable-gt-production.up.railway.app"
-).rstrip("/")
-
-# RESET DULCE
-RESET_DULCE_PAYMENT_URL = (
-    "https://app.recurrente.com/s/steeven-gil/o/reset-dulce-ebook-digital"
-)
-RESET_DULCE_PRICE = "Q60"
-
-# Cuando creemos el Volume de Railway, montaremos el PDF en esta ruta.
-RESET_DULCE_PDF_PATH = os.environ.get(
-    "RESET_DULCE_PDF_PATH",
-    "/data/RESET_DULCE.pdf"
-)
-
-
-# Biblioteca privada de Comida Saludable GT
-VECTOR_STORE_ID = "vs_6a9b49945b088191b211d8b71fdb9d0d"
-
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-
-# --------------------------------------------------
-# BASE DE DATOS POSTGRESQL
-# --------------------------------------------------
-
-def obtener_conexion_db():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL no está configurada")
-
-    return psycopg.connect(DATABASE_URL)
-
-
-def inicializar_base_datos():
-    try:
-        with obtener_conexion_db() as conn:
-            with conn.cursor() as cur:
-
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS instagram_users (
-                        sender_id TEXT PRIMARY KEY,
-                        free_recipe_used BOOLEAN NOT NULL DEFAULT FALSE,
-                        paid_access BOOLEAN NOT NULL DEFAULT FALSE,
-                        last_recipe TEXT,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    order_id = crear_o_actualizar_pedido_pendiente(
+                        sender_id,
+                        imagen_url
                     )
-                    """
-                )
 
-                # RESET DULCE se maneja aparte del límite de receta gratuita.
-                # Comprar el ebook NO habilita recetas ilimitadas.
-                cur.execute(
-                    """
-                    ALTER TABLE instagram_users
-                    ADD COLUMN IF NOT EXISTS reset_dulce_purchased
-                    BOOLEAN NOT NULL DEFAULT FALSE
-                    """
-                )
+                    if not order_id:
+                        enviar_mensaje_instagram(
+                            sender_id,
+                            "Recibí tu comprobante 🌿, pero tuve un inconveniente "
+                            "para registrarlo. Por favor intenta enviarlo nuevamente."
+                        )
+                        continue
 
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS reset_dulce_orders (
+                    enviar_mensaje_instagram(
+                        sender_id,
+                        "¡Gracias! 🌿 Recibimos tu comprobante de pago.\n\n"
+                        "Estamos validando tu compra. En cuanto sea confirmada, "
+                        "recibirás aquí mismo tu acceso a RESET DULCE."
+                    )
+
+                    enviar_comprobante_a_telegram(
+                        order_id,
+                        sender_id,
+                        imagen_url
+                    )
+
+                    continue
+
+                # --------------------------------------------------
+                # MENSAJE DE TEXTO NORMAL
+                # --------------------------------------------------
+                if texto_usuario:
+
+                    print("Mensaje recibido:", texto_usuario)
+                    print("Sender ID:", sender_id)
+
+                    respuesta_ia = generar_respuesta(
+                        sender_id,
+                        texto_usuario
+                    )
+
+                    print("Respuesta IA:", respuesta_ia)
+
+                    enviar_mensaje_instagram(
+                        sender_id,
+                        respuesta_ia
+                    )
+
+                    continue
+
+                print("Mensaje sin texto o imagen ignorado")
+
+    except Exception as e:
+
+        print("ERROR PROCESANDO WEBHOOK:", str(e))
+
+    return "EVENT_RECEIVED", 200
+
+
+# --------------------------------------------------
+# INICIALIZAR POSTGRESQL
+# --------------------------------------------------
+
+inicializar_base_datos()
+
+
+# --------------------------------------------------
+# INICIAR SERVIDOR
+# --------------------------------------------------
+
+if __name__ == "__main__":
+
+    port = int(os.environ.get("PORT", 8080))
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
